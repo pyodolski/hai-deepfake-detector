@@ -13,9 +13,8 @@ MODEL_ID = "microsoft/swin-tiny-patch4-window7-224"
 IMG_SIZE = 224
 NUM_FRAMES = 5
 
-#AGG = "topkmean"   # mean|max|topkmean
-#TOPK = 2
-AGG = "mean"
+AGG = "topkmean"   # mean|max|topkmean
+TOPK = 2
 
 TEST_ROOT = Path("./test_data")
 MODEL_PATH = Path("./model/model.pt")
@@ -47,26 +46,9 @@ def read_rgb_frames(file_path: Path, num_frames: int = NUM_FRAMES) -> list[np.nd
     if ext in VIDEO_EXTS:
         cap = cv2.VideoCapture(str(file_path))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        frames = []
         if total <= 0:
-            # fallback: 끝까지 읽고 거기서 num_frames만 균등 샘플링
-            tmp = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                tmp.append(frame)
             cap.release()
-
-            if len(tmp) == 0:
-                return []
-
-            idxs = uniform_frame_indices(len(tmp), num_frames)
-            for i in idxs:
-                frames.append(cv2.cvtColor(tmp[int(i)], cv2.COLOR_BGR2RGB))
-            return frames
-
+            return []
 
         idxs = uniform_frame_indices(total, num_frames)
         frames = []
@@ -82,17 +64,13 @@ def read_rgb_frames(file_path: Path, num_frames: int = NUM_FRAMES) -> list[np.nd
     return []
 
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
-
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize(256),
     transforms.CenterCrop(IMG_SIZE),
     transforms.ToTensor(),
-    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
 ])
-
 
 
 def aggregate_logits(logits: torch.Tensor, method="mean", topk=3) -> torch.Tensor:
@@ -126,11 +104,8 @@ def predict_file(model, fp: Path) -> float:
     elif logits.dim() > 1:
         logits = logits.view(-1)
 
-    logit = aggregate_logits(logits, AGG)
-
-    raw = torch.sigmoid(logit).item()   # 모델 raw 출력 (≈ P(real))
-    prob = 1.0 - raw                    # 제출용 (P(fake))
-
+    logit = aggregate_logits(logits, AGG, TOPK)
+    prob = torch.sigmoid(logit).item()
     return float(max(0.0, min(1.0, prob)))
 
 
