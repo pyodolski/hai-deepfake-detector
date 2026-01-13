@@ -23,3 +23,10 @@ ViT/260112/train_image/
 ViT/260112/train_video/
 ViT/260112/train_data/
 ViT/260112/model/*.pt
+
+ViT/260113/.venv/
+ViT/260113/test_data/
+ViT/260113/train_image/
+ViT/260113/train_video/
+ViT/260113/train_data/
+ViT/260113/model/*.pt
