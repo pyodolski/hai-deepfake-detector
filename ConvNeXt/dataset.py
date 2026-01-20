@@ -1,5 +1,7 @@
 """
-최종 데이터셋 - 모든 데이터 통합
+딥페이크 데이터셋
+
+데이터 경로 변경 시: __init__의 image_real_dir, image_fake_dir, video_real_dir, video_fake_dir 수정
 """
 import torch
 from torch.utils.data import Dataset
@@ -13,8 +15,8 @@ import random
 from face_detector import FaceDetector
 
 
-class FinalDeepfakeDataset(Dataset):
-    """모든 데이터를 통합한 최종 데이터셋"""
+class DeepfakeDataset(Dataset):
+    """딥페이크 탐지 데이터셋"""
     
     def __init__(
         self,
@@ -27,13 +29,15 @@ class FinalDeepfakeDataset(Dataset):
         num_frames_per_video: int = 16,
         image_size: int = 224,
         max_samples_per_class: int = None,
-        sample_offset: int = 0  # 샘플 시작 위치
+        max_video_samples_per_class: int = None,  # 비디오 샘플 수 추가
+        sample_offset: int = 0
     ):
         self.transform = transform
         self.use_face_detection = use_face_detection
         self.num_frames_per_video = num_frames_per_video
         self.image_size = image_size
-        self.sample_offset = sample_offset  # offset 저장
+        self.sample_offset = sample_offset
+        self.max_video_samples_per_class = max_video_samples_per_class  # 비디오 샘플 수 저장
         
         # 얼굴 검출기
         if use_face_detection:
@@ -96,25 +100,41 @@ class FinalDeepfakeDataset(Dataset):
         
         print(f"  Image FAKE: {fake_count}")
         
-        # 3. 비디오 - REAL
+        # 3. 비디오 - REAL (샘플링 적용)
         video_real_count = 0
         video_real_path = Path(video_real_dir)
         if video_real_path.exists():
+            video_real_files = []
             for ext in video_exts:
-                for file_path in video_real_path.glob(f"*{ext}"):
-                    self.samples.append((str(file_path), 0, 'video'))
-                    video_real_count += 1
+                video_real_files.extend(list(video_real_path.glob(f"*{ext}")))
+            
+            # 비디오 샘플링 (config에서 설정한 개수만큼)
+            if self.max_video_samples_per_class:
+                video_real_files = sorted(video_real_files)
+                video_real_files = video_real_files[:self.max_video_samples_per_class]  # ← config.py의 max_video_samples_per_class 값 사용
+            
+            for file_path in video_real_files:
+                self.samples.append((str(file_path), 0, 'video'))
+                video_real_count += 1
         
         print(f"  Video REAL: {video_real_count}")
         
-        # 4. 비디오 - FAKE
+        # 4. 비디오 - FAKE (샘플링 적용)
         video_fake_count = 0
         video_fake_path = Path(video_fake_dir)
         if video_fake_path.exists():
+            video_fake_files = []
             for ext in video_exts:
-                for file_path in video_fake_path.glob(f"*{ext}"):
-                    self.samples.append((str(file_path), 1, 'video'))
-                    video_fake_count += 1
+                video_fake_files.extend(list(video_fake_path.glob(f"*{ext}")))
+            
+            # 비디오 샘플링 (config에서 설정한 개수만큼)
+            if self.max_video_samples_per_class:
+                video_fake_files = sorted(video_fake_files)
+                video_fake_files = video_fake_files[:self.max_video_samples_per_class]  # ← config.py의 max_video_samples_per_class 값 사용
+            
+            for file_path in video_fake_files:
+                self.samples.append((str(file_path), 1, 'video'))
+                video_fake_count += 1
         
         print(f"  Video FAKE: {video_fake_count}")
         

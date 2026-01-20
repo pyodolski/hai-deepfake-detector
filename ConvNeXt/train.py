@@ -1,5 +1,8 @@
 """
-최종 모델 학습 - 모든 데이터 사용
+파인튜닝 학습 코드
+
+모델 경로 변경 시: config.py의 pretrained_model 수정
+체크포인트 저장 경로 변경 시: config.py의 checkpoint_dir 수정
 """
 import torch
 import torch.nn as nn
@@ -10,17 +13,18 @@ import json
 from pathlib import Path
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_recall_fscore_support
 import warnings
+import random
 warnings.filterwarnings('ignore')
 
 from model import DeepfakeDetector
-from dataset_final import FinalDeepfakeDataset
-from config_final import FinalTrainConfig
+from dataset import DeepfakeDataset
+from config import Config
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 
-def create_transforms(config: FinalTrainConfig):
-    """강력한 데이터 증강"""
+def create_transforms(config: Config):
+    """데이터 증강 변환 생성"""
     train_transform = A.Compose([
         A.HorizontalFlip(p=config.horizontal_flip_prob),
         A.VerticalFlip(p=config.vertical_flip_prob),
@@ -58,21 +62,8 @@ def create_transforms(config: FinalTrainConfig):
     return train_transform, val_transform
 
 
-class LabelSmoothingBCELoss(nn.Module):
-    """Label Smoothing을 적용한 BCE Loss"""
-    def __init__(self, smoothing=0.1):
-        super().__init__()
-        self.smoothing = smoothing
-        self.bce = nn.BCEWithLogitsLoss()
-    
-    def forward(self, pred, target):
-        # Label smoothing: 0 → smoothing, 1 → 1-smoothing
-        target = target * (1 - self.smoothing) + self.smoothing / 2
-        return self.bce(pred, target)
-
-
 def train_epoch(model, loader, criterion, optimizer, scaler, device, config):
-    """1 에포크 학습"""
+    """1 에포크 학습 수행"""
     model.train()
     total_loss = 0
     
@@ -103,7 +94,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, config):
 
 
 def validate(model, loader, criterion, device):
-    """검증"""
+    """검증 수행"""
     model.eval()
     total_loss = 0
     all_preds = []
@@ -123,7 +114,7 @@ def validate(model, loader, criterion, device):
             
             total_loss += loss.item()
     
-    # Metrics
+    # 평가 지표 계산
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     
@@ -145,37 +136,24 @@ def validate(model, loader, criterion, device):
 
 
 def main():
-    config = FinalTrainConfig()
+    config = Config()
     
-    # Device
-    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Seed
+    # 시드 설정
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
+    random.seed(config.seed)
     
-    # 체크포인트 경로 확인
-    resume_path = Path(config.checkpoint_dir) / 'ckpt_last.pth'
-    start_epoch = 0
-    best_auc = 0
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'val_auc': [],
-        'val_acc': [],
-        'val_f1': []
-    }
+    # 디바이스 설정
+    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}\n")
+    print("=" * 60)
     
-    # 기존 모델 로드 (pretrained_model이 있으면)
-    load_pretrained = hasattr(config, 'pretrained_model') and Path(config.pretrained_model).exists()
-    
-    # Transforms
+    # 데이터 변환 생성
     train_transform, val_transform = create_transforms(config)
     
-    # Dataset
-    print("\n" + "="*60)
-    full_dataset = FinalDeepfakeDataset(
+    # 데이터셋 로드
+    print("Loading dataset...")
+    full_dataset = DeepfakeDataset(
         image_real_dir=config.image_real_dir,
         image_fake_dir=config.image_fake_dir,
         video_real_dir=config.video_real_dir,
@@ -184,10 +162,12 @@ def main():
         use_face_detection=config.face_detection,
         num_frames_per_video=config.num_frames_per_video,
         image_size=config.image_size,
-        max_samples_per_class=config.max_samples_per_class
+        max_samples_per_class=config.max_samples_per_class,
+        max_video_samples_per_class=config.max_video_samples_per_class,  # 비디오 샘플 수 전달
+        sample_offset=config.sample_offset
     )
     
-    # Train/Val split
+    # Train/Val 분할
     val_size = int(len(full_dataset) * config.val_split)
     train_size = len(full_dataset) - val_size
     train_dataset, val_dataset = random_split(
@@ -196,20 +176,20 @@ def main():
         generator=torch.Generator().manual_seed(config.seed)
     )
     
-    # Transforms 적용
+    # 변환 적용
     train_dataset.dataset.transform = train_transform
     val_dataset.dataset.transform = val_transform
     
     print(f"\nTrain: {len(train_dataset)}, Val: {len(val_dataset)}")
-    print("="*60)
+    print("=" * 60)
     
-    # DataLoader
+    # DataLoader 생성
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        pin_memory=True if device.type == 'cuda' else False
+        pin_memory=False
     )
     
     val_loader = DataLoader(
@@ -217,10 +197,10 @@ def main():
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
-        pin_memory=True if device.type == 'cuda' else False
+        pin_memory=False
     )
     
-    # Model
+    # 모델 생성
     print(f"\nCreating model: {config.model_name}")
     model = DeepfakeDetector(
         model_name=config.model_name,
@@ -228,95 +208,78 @@ def main():
         num_classes=config.num_classes
     )
     
-    # 기존 모델 로드 (fine-tuning)
-    if load_pretrained:
+    # 체크포인트 초기화
+    start_epoch = 0
+    best_auc = 0.0
+    history = {'train_loss': [], 'val_loss': [], 'val_auc': [], 'val_acc': [], 'val_f1': []}
+    
+    # 체크포인트 로드 (이어서 학습)
+    checkpoint_path = Path(config.checkpoint_dir) / "ckpt_last.pth"
+    if checkpoint_path.exists():
+        print(f"\nLoading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_auc = checkpoint.get('best_auc', 0.0)
+        history = checkpoint.get('history', history)
+        print(f"✓ Resuming from epoch {start_epoch}, Best AUC: {best_auc:.4f}")
+    elif Path(config.pretrained_model).exists():
+        # 사전학습 모델 로드 (처음 시작)
         print(f"\nLoading pretrained model: {config.pretrained_model}")
-        pretrained_checkpoint = torch.load(config.pretrained_model, map_location=device, weights_only=False)
-        if 'model_state_dict' in pretrained_checkpoint:
-            model.load_state_dict(pretrained_checkpoint['model_state_dict'])
+        pretrained_state = torch.load(config.pretrained_model, map_location=device, weights_only=False)
+        if 'model_state_dict' in pretrained_state:
+            model.load_state_dict(pretrained_state['model_state_dict'])
         else:
-            model.load_state_dict(pretrained_checkpoint)
+            model.load_state_dict(pretrained_state)
         print("✓ Pretrained model loaded successfully")
+    else:
+        print(f"\nWarning: Pretrained model not found at {config.pretrained_model}")
+        print("Starting from scratch with ImageNet weights")
     
     model = model.to(device)
     
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Loss & Optimizer
-    if config.label_smoothing > 0:
-        criterion = LabelSmoothingBCELoss(smoothing=config.label_smoothing)
-    else:
-        criterion = nn.BCEWithLogitsLoss()
+    # 손실 함수
+    criterion = nn.BCEWithLogitsLoss()
     
+    # 옵티마이저
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay
     )
     
-    # Scheduler
+    # 스케줄러
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=config.epochs - config.warmup_epochs
+        T_max=config.epochs,
+        eta_min=1e-7
     )
     
-    # Warmup scheduler
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,
-        total_iters=config.warmup_epochs
-    )
-    
-    # Scaler
+    # Mixed Precision Scaler
     scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp)
     
-    # 체크포인트에서 복구
-    if resume_path.exists():
-        print(f"\n{'='*60}")
-        print(f"Found checkpoint: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=device)
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        if 'scaler_state_dict' in checkpoint:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
-        start_epoch = checkpoint['epoch'] + 1
-        best_auc = checkpoint.get('best_auc', 0)
-        history = checkpoint.get('history', history)
-        
-        print(f"Resuming from epoch {start_epoch}")
-        print(f"Best AUC so far: {best_auc:.4f}")
-        print(f"{'='*60}\n")
-    else:
-        print(f"\nNo checkpoint found. Starting from scratch.\n")
+    print("\n" + "=" * 60)
+    print("Starting Training")
+    print("=" * 60 + "\n")
     
+    # 학습 루프
     patience_counter = 0
     
-    print("\n" + "="*60)
-    print("Starting Training")
-    print("="*60)
-    
-    for epoch in range(start_epoch, config.epochs):
-        print(f"\nEpoch {epoch+1}/{config.epochs}")
+    for epoch in range(start_epoch, start_epoch + config.epochs):
+        print(f"Epoch {epoch + 1}/{start_epoch + config.epochs}")
         print(f"LR: {optimizer.param_groups[0]['lr']:.6f}")
         
-        # Train
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler, device, config)
+        # 학습
+        train_loss = train_epoch(
+            model, train_loader, criterion, optimizer, scaler, device, config
+        )
         
-        # Validate
+        # 검증
         val_metrics = validate(model, val_loader, criterion, device)
         
-        # Scheduler
-        if epoch < config.warmup_epochs:
-            warmup_scheduler.step()
-        else:
-            scheduler.step()
-        
-        # History
+        # 히스토리 저장
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_metrics['loss'])
         history['val_auc'].append(val_metrics['auc'])
@@ -329,67 +292,54 @@ def main():
         print(f"Val Acc: {val_metrics['acc']:.4f}")
         print(f"Val F1: {val_metrics['f1']:.4f}")
         
-        # Save best model
+        # Best 모델 저장
         if val_metrics['auc'] > best_auc:
             best_auc = val_metrics['auc']
-            patience_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_auc': val_metrics['auc'],
-                'val_acc': val_metrics['acc'],
-            }, Path(config.checkpoint_dir) / 'best_model.pt')
+            best_path = Path(config.checkpoint_dir) / "best_model.pt"
+            torch.save(model.state_dict(), best_path)
             print(f"✓ Best model saved (AUC: {val_metrics['auc']:.4f})")
+            patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= config.patience:
-                print(f"\nEarly stopping at epoch {epoch+1}")
-                break
         
-        # 매 epoch마다 자동 저장 (Google Drive)
+        # 체크포인트 저장
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
-            'val_auc': val_metrics['auc'],
-            'val_acc': val_metrics['acc'],
-            'val_loss': val_metrics['loss'],
-            'train_loss': train_loss,
             'best_auc': best_auc,
             'history': history
         }
         
-        # Last checkpoint 저장
-        last_ckpt_path = Path(config.checkpoint_dir) / 'ckpt_last.pth'
-        torch.save(checkpoint, last_ckpt_path)
-        print(f"✓ Checkpoint saved: {last_ckpt_path}")
+        torch.save(checkpoint, checkpoint_path)
+        print(f"✓ Checkpoint saved: {checkpoint_path}")
         
-        # 매 N epoch마다 별도 저장 (복구용)
-        if (epoch + 1) % 5 == 0:
-            epoch_ckpt_path = Path(config.checkpoint_dir) / f'ckpt_epoch_{epoch+1}.pth'
-            torch.save(checkpoint, epoch_ckpt_path)
-            print(f"✓ Epoch checkpoint saved: {epoch_ckpt_path}")
+        # 스케줄러 스텝
+        scheduler.step()
+        
+        # Early stopping
+        if patience_counter >= config.patience:
+            print(f"\nEarly stopping triggered (patience: {config.patience})")
+            break
+        
+        print()
     
-    # Save final model
-    torch.save({
-        'epoch': config.epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'val_auc': val_metrics['auc'],
-    }, Path(config.checkpoint_dir) / 'final_model.pt')
+    # 최종 모델 저장
+    final_path = Path(config.checkpoint_dir) / "final_model.pt"
+    torch.save(model.state_dict(), final_path)
     
-    # Save history
-    with open(Path(config.checkpoint_dir) / 'history.json', 'w') as f:
+    # 히스토리 저장
+    history_path = Path(config.checkpoint_dir) / "history.json"
+    with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)
     
-    print("\n" + "="*60)
+    print("=" * 60)
     print("Training completed!")
     print(f"Best AUC: {best_auc:.4f}")
     print(f"Models saved to: {config.checkpoint_dir}")
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":

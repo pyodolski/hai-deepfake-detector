@@ -1,5 +1,8 @@
 """
-딥페이크 탐지 추론
+딥페이크 탐지 추론 코드
+
+모델 경로 변경 시: inference() 함수의 model_path 파라미터 수정
+테스트 데이터 경로 변경 시: test_dir 파라미터 수정
 """
 import torch
 import torch.nn.functional as F
@@ -18,7 +21,7 @@ from face_detector import FaceDetector
 
 
 class TestDataset(Dataset):
-    """테스트 데이터셋"""
+    """테스트 데이터셋 - 추론용"""
     def __init__(self, test_dir, transform=None, use_face_detection=True, num_frames=8, image_size=224):
         self.test_dir = Path(test_dir)
         self.transform = transform
@@ -50,7 +53,7 @@ class TestDataset(Dataset):
         return frames, file_name
     
     def _load_image(self, image_path):
-        """이미지 로드"""
+        """이미지 파일 로드 및 전처리"""
         img = cv2.imread(str(image_path))
         if img is None:
             return torch.zeros(1, 3, self.image_size, self.image_size)
@@ -83,7 +86,7 @@ class TestDataset(Dataset):
         return img.unsqueeze(0)  # [1, C, H, W]
     
     def _load_video(self, video_path):
-        """비디오에서 프레임 추출"""
+        """비디오에서 프레임 추출 및 전처리"""
         cap = cv2.VideoCapture(str(video_path))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
@@ -134,19 +137,31 @@ class TestDataset(Dataset):
 def inference(model_path, test_dir, output_csv, model_name="convnext_small", 
               image_size=224, batch_size=32, use_face_detection=True, 
               num_frames=8, device="cuda"):
-    """추론 실행"""
+    """
+    추론 실행 함수
     
-    # Device
+    Args:
+        model_path: 모델 가중치 파일 경로 (.pt 파일)
+        test_dir: 테스트 데이터 디렉토리 경로
+        output_csv: 결과 저장 CSV 파일 경로
+        model_name: 모델 아키텍처 이름
+        image_size: 입력 이미지 크기
+        batch_size: 배치 크기 (사용 안함, 호환성 유지용)
+        use_face_detection: 얼굴 검출 사용 여부
+        num_frames: 비디오당 추출할 프레임 수
+        device: 디바이스 (cuda/cpu)
+    """
+    # 디바이스 설정
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Transform
+    # 데이터 변환 정의
     transform = A.Compose([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
     
-    # Dataset
+    # 데이터셋 생성
     dataset = TestDataset(
         test_dir=test_dir,
         transform=transform,
@@ -157,7 +172,7 @@ def inference(model_path, test_dir, output_csv, model_name="convnext_small",
     
     print(f"\nTotal test files: {len(dataset)}")
     
-    # Model
+    # 모델 생성 및 로드
     model = DeepfakeDetector(model_name=model_name, pretrained=False, num_classes=1)
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     
@@ -171,20 +186,23 @@ def inference(model_path, test_dir, output_csv, model_name="convnext_small",
     
     print(f"Model loaded: {model_path}")
     
-    # Inference
+    # 추론 수행
     results = []
+    total_files = len(dataset)
+    
+    print(f"\n추론 시작: 총 {total_files}개 파일")
+    print("-" * 60)
     
     with torch.no_grad():
-        for frames, file_name in tqdm(dataset, desc="Inference"):
+        for idx, (frames, file_name) in enumerate(tqdm(dataset, desc="Inference"), 1):
             frames = frames.to(device)  # [N, C, H, W]
             
-            # 배치로 처리
+            # 모델 추론
             logits = model(frames)  # [N, 1]
             probs = torch.sigmoid(logits)  # [N, 1]
             
-            # 비디오 추론 개선: 중앙값 사용 (평균보다 아웃라이어에 강함)
+            # 비디오는 중앙값, 이미지는 평균값 사용
             if probs.shape[0] > 1:  # 비디오 (여러 프레임)
-                # 중앙값 사용
                 avg_prob = probs.median().item()
             else:  # 이미지 (단일 프레임)
                 avg_prob = probs.mean().item()
@@ -193,10 +211,14 @@ def inference(model_path, test_dir, output_csv, model_name="convnext_small",
                 'filename': file_name,
                 'probability': avg_prob
             })
+            
+            # 진행 상황 출력 (5개마다)
+            if idx % 5 == 0:
+                print(f"  [{idx}/{total_files}] {file_name}: {avg_prob:.4f}")
     
     # CSV 저장
     df = pd.DataFrame(results)
-    df.columns = ['filename', 'prob']  # 제출 양식에 맞게 컬럼명 변경
+    df.columns = ['filename', 'prob']  # 제출 양식에 맞게
     df.to_csv(output_csv, index=False)
     
     print(f"\n✓ Results saved: {output_csv}")
